@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+import os,re,glob,numpy as np,xarray as xr,geopandas as gpd,matplotlib.pyplot as plt
+from rasterio.transform import from_bounds
+from rasterio.features import rasterize
+from shapely.geometry import box
+import matplotlib as mpl
+recon_path=r"D:\1700\2\tree_ring4 - SFRCS(EPS0.85).nc"
+model_dir=r"D:\Model data\NPP-TRENDY\nppS2\9-8\1700-2"
+shp_path=r"D:\10\欧洲\shp\欧洲7类.shp"
+out_dir=r"D:\1700\欧洲图4\FRCS\不差分\合成线段"
+out_png=os.path.join(out_dir,"欧洲20不差分图1950-2020.png")
+YEAR_MIN,YEAR_MAX=1950,2020
+lon_min,lon_max=-11.0,57
+lat_min,lat_max=30.0,75.0
+WIN=20
+MIN_N=10
+A_PAD_FRAC=0.04
+label_map={2:"B",3:"C",4:"Dfa",5:"Dfb"}
+base_classes=[2,3,4,5]
+agg_defs={102:("Warm",[1,2,3,4,5]),103:("Cold",[6,7]),104:("All",[2,3,4,5,6,7])}
+plot_order=[2,3,4,5,102,103,104]
+legend_pos={2:"lower left",3:"lower left",4:"lower left",5:"lower right",6:"lower right",102:"lower left",103:"lower right",104:"lower left"}
+mpl.rcParams['font.family']='Times New Roman'
+mpl.rcParams['axes.unicode_minus']=False
+mpl.rcParams['font.size']=16
+def rasterize_classes(p,lon,lat):
+    gdf=gpd.read_file(p)
+    if gdf.crs is None:gdf.set_crs(epsg=4326,inplace=True)
+    elif gdf.crs.to_epsg()!=4326:gdf=gdf.to_crs(epsg=4326)
+    gdf=gpd.clip(gdf,box(lon_min,lat_min,lon_max,lat_max))
+    prefer=["code","CODE","Code","class","Class","CLASS","label","Label"]
+    col=next((c for c in prefer if c in gdf.columns),None)
+    if col is None:col=next(c for c in gdf.columns if c.lower() not in ("geometry","geom","id","fid","ogc_fid"))
+    if not np.issubdtype(gdf[col].dtype,np.number):
+        name2code={"B 干旱":2,"C 温带":3,"Dfa 冷带全湿炎夏":4,"Dfb 冷带全湿暖夏":5,"D 其他冷带":6,"D other":6,"E 寒带":7}
+        gdf["__code__"]=gdf[col].map(name2code).astype("Int16")
+    else:
+        gdf["__code__"]=gdf[col].astype("Int16")
+    gdf=gdf.dropna(subset=["__code__"])
+    tf=from_bounds(float(lon.min()),float(lat.min()),float(lon.max()),float(lat.max()),len(lon),len(lat))
+    grid=rasterize([(geom,int(v)) for geom,v in zip(gdf.geometry,gdf["__code__"])],out_shape=(len(lat),len(lon)),transform=tf,fill=0,dtype="int16")
+    if lat[0]<lat[-1]:grid=np.flipud(grid)
+    return grid
+def zone_mask(cls_grid,code):
+    return (cls_grid==code) if code in base_classes else np.isin(cls_grid,agg_defs[code][1])
+def get_recon_da(ds):
+    cand=[v for v in ds.data_vars if 'year' in ds[v].dims]
+    prefer=[v for v in cand if ('recon' in v.lower()) or ('agedep' in v.lower())]
+    name=prefer[0] if prefer else (cand[0] if cand else None)
+    if name is None:raise ValueError("no yearly target variable")
+    return ds[name]
+def get_model_var(ds):
+    cand=[v for v in ds.data_vars if 'year' in ds[v].dims]
+    prefer=[v for v in cand if v.lower() in ('npp','gpp')]
+    return prefer[0] if prefer else (cand[0] if cand else None)
+def rolling_corr(a,b,win,min_n):
+    a=np.asarray(a);b=np.asarray(b);T=a.shape[0];L=T-win+1
+    out=np.full((L,)+a.shape[1:],np.nan,dtype=np.float32)
+    for t in range(L):
+        X=a[t:t+win];Y=b[t:t+win]
+        m=np.isfinite(X)&np.isfinite(Y);n=m.sum(axis=0)
+        Xz=np.where(m,X,0.0);Yz=np.where(m,Y,0.0)
+        sx=Xz.sum(axis=0);sy=Yz.sum(axis=0)
+        sxx=(Xz*Xz).sum(axis=0);syy=(Yz*Yz).sum(axis=0);sxy=(Xz*Yz).sum(axis=0)
+        num=n*sxy-sx*sy;den=np.sqrt((n*sxx-sx*sx)*(n*syy-sy*sy))
+        v=(n>=min_n)&(den>0);r=np.full_like(den,np.nan,dtype=np.float32);r[v]=num[v]/den[v];out[t]=r
+    return out
+def main():
+    os.makedirs(out_dir,exist_ok=True)
+    dsA=xr.open_dataset(recon_path)
+    daA=get_recon_da(dsA).sel(latitude=slice(lat_min,lat_max),longitude=slice(lon_min,lon_max)).sel(year=slice(YEAR_MIN,YEAR_MAX))
+    yearsA=daA['year'].values.astype(int)
+    latA,lonA=daA['latitude'].values,daA['longitude'].values
+    cls_grid=rasterize_classes(shp_path,lonA,latA)
+    files=[f for f in sorted(glob.glob(os.path.join(model_dir,"*.nc"))) if not os.path.basename(f).startswith("2")]
+    zone_series_all={code:{} for code in plot_order}
+    for fp in files:
+        name=os.path.splitext(os.path.basename(fp))[0]
+        dsB=xr.open_dataset(fp);varB=get_model_var(dsB)
+        if varB is None:dsB.close();continue
+        try:daB=dsB[varB].sel(latitude=slice(lat_min,lat_max),longitude=slice(lon_min,lon_max)).sel(year=slice(YEAR_MIN,YEAR_MAX))
+        except Exception:dsB.close();continue
+        yearsB=daB['year'].values.astype(int)
+        common=np.intersect1d(yearsA,yearsB)
+        if common.size<WIN+1:dsB.close();continue
+        A=daA.sel(year=common);B=daB.sel(year=common)
+        if (B.sizes.get('latitude')!=A.sizes['latitude']) or (B.sizes.get('longitude')!=A.sizes['longitude']) or (not np.allclose(B['latitude'],A['latitude'])) or (not np.allclose(B['longitude'],A['longitude'])):B=B.interp(latitude=A['latitude'],longitude=A['longitude'])
+        A=A.load().values.astype(np.float32);B=B.load().values.astype(np.float32);dsB.close()
+        R=rolling_corr(A,B,WIN,MIN_N);yrs=common[WIN-1:]
+        for code in plot_order:
+            msk=zone_mask(cls_grid,code)
+            ts=[float(np.nanmean(R[t][msk & np.isfinite(R[t])])) if np.any(msk & np.isfinite(R[t])) else np.nan for t in range(R.shape[0])]
+            zone_series_all[code][name]=(yrs,np.array(ts,dtype=float))
+    def top3(d):
+        if not d:return []
+        its=[]
+        for k,(x,y) in d.items():
+            if np.isfinite(y).any():its.append((k,float(np.nanmean(y))))
+        its.sort(key=lambda z:z[1],reverse=True)
+        return [k for k,_ in its[:3]]
+    t3z={};vminz={};vmaxz={}
+    for code in plot_order:
+        t3=top3(zone_series_all[code]);t3z[code]=t3
+        ys=[]
+        for m in t3:
+            y=zone_series_all[code][m][1]
+            if np.isfinite(y).any():ys+=[np.nanmin(y),np.nanmax(y)]
+        if ys:
+            vminz[code]=float(np.nanmin(ys));vmaxz[code]=float(np.nanmax(ys))
+        else:
+            vminz[code]=np.nan;vmaxz[code]=np.nan
+    rng=[vmaxz[c]-vminz[c] for c in plot_order if np.isfinite(vminz.get(c,np.nan)) and np.isfinite(vmaxz.get(c,np.nan)) and vmaxz[c]>vminz[c]]
+    Rbase=max(rng) if rng else 0.2
+    fig,axes=plt.subplots(2,4,figsize=(16,7),constrained_layout=True);axes=axes.ravel()
+    for i,code in enumerate(plot_order):
+        ax=axes[i];d=zone_series_all[code];t3=t3z[code]
+        if not t3:ax.text(0.5,0.5,"No data",ha="center",va="center",fontsize=10);ax.set_axis_off();continue
+        used=set()
+        for m in t3:
+            x,y=d[m];lab=m
+            if lab in used:
+                c=2
+                while f"{lab} ({c})" in used:c+=1
+                lab=f"{lab} ({c})"
+            used.add(lab)
+            ax.plot(x,y,label=lab,linewidth=1)
+        xs_sets=[set(d[m][0].tolist()) for m in t3]
+        inter_years=sorted(list(set.intersection(*xs_sets))) if xs_sets else []
+        if len(inter_years)>=2:
+            Ystack=[]
+            for m in t3:
+                xm,ym=d[m]
+                idx=np.searchsorted(xm,inter_years)
+                ok=(idx<len(xm))&(xm[idx]==np.array(inter_years))
+                arr=np.full(len(inter_years),np.nan);arr[ok]=ym[idx[ok]]
+                Ystack.append(arr)
+            Ystack=np.vstack(Ystack)
+            mean_curve=np.nanmean(Ystack,axis=0)
+            ax.plot(inter_years,mean_curve,linewidth=2,label="Mean of top3")
+            tag=label_map[code] if code in base_classes else agg_defs[code][0]
+            csv_path=os.path.join(out_dir,f"{tag}.csv")
+            with open(csv_path,"w",encoding="utf-8") as f:
+                f.write("year,mean_r\n")
+                for xv,yv in zip(inter_years,mean_curve):
+                    if np.isfinite(yv):f.write(f"{int(xv)},{yv:.6f}\n")
+        vmin=vminz[code];vmax=vmaxz[code]
+        if np.isfinite(vmin) and np.isfinite(vmax):mid=0.5*(vmin+vmax);ymin=mid-Rbase/2;ymax=mid+Rbase/2
+        else:mid=0.0;ymin=mid-Rbase/2;ymax=mid+Rbase/2
+        ax.set_ylim(ymin,ymax);ax.margins(x=0.01);ax.set_xlabel("Year");ax.set_ylabel("Mean r")
+        tag=label_map[code] if code in base_classes else agg_defs[code][0]
+        ax.text(0.02,0.92,tag,transform=ax.transAxes,ha="left",va="top",fontsize=11,fontweight="bold")
+        lg=ax.legend(fontsize=8,frameon=True,loc=legend_pos.get(code,"lower right"),borderpad=0.05,handlelength=1.2,handletextpad=0.4,markerscale=0.6)
+        if lg is not None:
+            try:lg.get_frame().set_boxstyle("sawtooth",pad=0.05)
+            except Exception:pass
+    for j in range(len(plot_order),len(axes)):fig.delaxes(axes[j])
+    fig.savefig(out_png,dpi=300,bbox_inches="tight")
+    plt.close(fig);dsA.close()
+if __name__=="__main__":main()
